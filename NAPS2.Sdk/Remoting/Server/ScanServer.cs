@@ -85,6 +85,21 @@ public class ScanServer : IDisposable
         return (esclDeviceConfig.Port, esclDeviceConfig.TlsPort);
     }
 
+		public EsclDeviceConfig MakeEsclDeviceConfig2(ScanDevice device)
+    {
+        return new EsclDeviceConfig
+        {
+            Capabilities = new EsclCapabilities
+            {
+                MakeAndModel = device.Name,
+                Uuid = device.Name,
+                IconPng = _defaultIconPng,
+                // TODO: Ideally we want to get the actual device capabilities (flatbed/feeder, resolution etc.)
+            },
+            CreateJob = settings => new ScanJob(_scanningContext, ScanControllerFactory(), device, settings)
+        };
+    }
+
     private EsclDeviceConfig MakeEsclDeviceConfig(ScanServerDevice device)
     {
         return new EsclDeviceConfig

@@ -8,7 +8,7 @@ using NAPS2.Serialization;
 
 namespace NAPS2.Remoting.Server;
 
-internal class ScanJob : IEsclScanJob
+public class ScanJob : IEsclScanJob
 {
     private readonly ScanningContext _scanningContext;
     private readonly ScanController _controller;

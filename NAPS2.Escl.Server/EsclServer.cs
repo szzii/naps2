@@ -1,8 +1,12 @@
 using System.Security.Cryptography.X509Certificates;
 using EmbedIO;
 using EmbedIO.WebApi;
+using System.Text.Json;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using NAPS2.Scan;
+using NAPS2.Remoting.Server;
 
 namespace NAPS2.Escl.Server;
 
@@ -18,18 +22,29 @@ public class EsclServer : IEsclServer
     private CancellationTokenSource? _cts;
 
     public EsclSecurityPolicy SecurityPolicy { get; set; }
+    public ScanController ScanController { get; set; }
+    public ScanningContext ScanningContext { get; set; }
+    public ScanServer scanServer { get; set; }
+
 
     public X509Certificate2? Certificate { get; set; }
 
     public ILogger Logger { get; set; } = NullLogger.Instance;
 
+		// 辅助：根据 cfg.Name 计算 Base64 ID
+    private static string ComputeNameBase64(string name)
+    {
+        var bytes = Encoding.UTF8.GetBytes(name ?? "");
+        return Convert.ToBase64String(bytes);
+    }
+
     public void AddDevice(EsclDeviceConfig deviceConfig)
     {
-        var deviceCtx = new DeviceContext(deviceConfig);
-        _devices[deviceConfig] = deviceCtx;
+				var deviceCtx = new DeviceContext(deviceConfig);
+				_devices[deviceConfig] = deviceCtx;
         if (_started)
         {
-            Task.Run(() => StartServerAndAdvertise(deviceCtx));
+            Task.Run(() => StartServerAndAdvertise());
         }
     }
 
@@ -75,47 +90,50 @@ public class EsclServer : IEsclServer
                 $"EsclSecurityPolicy of {SecurityPolicy} needs a certificate to be specified");
         }
 
-        var tasks = new List<Task>();
-        foreach (var device in _devices.Keys)
-        {
-            var deviceCtx = _devices[device];
-            deviceCtx.StartTask = Task.Run(() => StartServerAndAdvertise(deviceCtx));
-            tasks.Add(deviceCtx.StartTask);
-        }
-        await Task.WhenAll(tasks);
+        //var tasks = new List<Task>();
+				await Task.Run(() => StartServerAndAdvertise());
+      // foreach (var device in _devices.Keys)
+      // {
+      //     var deviceCtx = _devices[device];
+      //     await Task.Run(() => StartServerAndAdvertise(deviceCtx));
+      //     tasks.Add(deviceCtx.StartTask);
+      // }
+      // await Task.WhenAll(tasks);
     }
 
-    private async Task StartServerAndAdvertise(DeviceContext deviceCtx)
+    private async Task StartServerAndAdvertise()
     {
-        var cancelToken = CancellationTokenSource.CreateLinkedTokenSource(_cts!.Token, deviceCtx.Cts.Token).Token;
+        //var cancelToken = CancellationTokenSource.CreateLinkedTokenSource(_cts!.Token, deviceCtx.Cts.Token).Token;
         // Try to run the server with the port specified in the EsclDeviceConfig first. If that fails, try random ports
         // instead, and store the actually-used port back in EsclDeviceConfig so it can be advertised correctly.
-        bool hasHttp = !SecurityPolicy.HasFlag(EsclSecurityPolicy.ServerRequireHttps);
-        bool hasHttps = !SecurityPolicy.HasFlag(EsclSecurityPolicy.ServerDisableHttps) && Certificate != null;
-        if (hasHttp)
-        {
-            await PortFinder.RunWithSpecifiedOrRandomPort(deviceCtx.Config.Port, async port =>
-            {
-                await StartServer(deviceCtx, port, false, cancelToken);
-                deviceCtx.Config.Port = port;
-            }, cancelToken);
-        }
-        if (hasHttps)
-        {
-            await PortFinder.RunWithSpecifiedOrRandomPort(deviceCtx.Config.TlsPort, async tlsPort =>
-            {
-                await StartServer(deviceCtx, tlsPort, true, cancelToken);
-                deviceCtx.Config.TlsPort = tlsPort;
-            }, cancelToken);
-        }
-        deviceCtx.Advertiser.AdvertiseDevice(deviceCtx.Config, hasHttp, hasHttps);
+       // bool hasHttp = !SecurityPolicy.HasFlag(EsclSecurityPolicy.ServerRequireHttps);
+        //bool hasHttps = !SecurityPolicy.HasFlag(EsclSecurityPolicy.ServerDisableHttps) && Certificate != null;
+
+				await StartServer(9880, false);
+       //if (hasHttp)
+       //{
+       //    await PortFinder.RunWithSpecifiedOrRandomPort(deviceCtx.Config.Port, async port =>
+       //    {
+       //        await StartServer(deviceCtx, port, false, cancelToken);
+       //        deviceCtx.Config.Port = port;
+       //    }, cancelToken);
+       //}
+       //if (hasHttps)
+       //{
+       //    await PortFinder.RunWithSpecifiedOrRandomPort(deviceCtx.Config.TlsPort, async tlsPort =>
+       //    {
+       //        await StartServer(deviceCtx, tlsPort, true, cancelToken);
+       //        deviceCtx.Config.TlsPort = tlsPort;
+       //    }, cancelToken);
+       //}
+        //deviceCtx.Advertiser.AdvertiseDevice(deviceCtx.Config, hasHttp, hasHttps);
     }
 
-    private async Task StartServer(DeviceContext deviceCtx, int port, bool tls, CancellationToken cancelToken)
+    private async Task StartServer(int port, bool tls)
     {
         var protocol = tls ? "https" : "http";
         var url = $"{protocol}://+:{port}/";
-        deviceCtx.ServerState = new EsclServerState(Logger);
+				var serverState = new EsclServerState(Logger); // ← 创建单例
         var server = new WebServer(o => o
                 .WithMode(HttpListenerMode.EmbedIO)
                 .WithUrlPrefix(url)
@@ -123,8 +141,8 @@ public class EsclServer : IEsclServer
             .HandleUnhandledException(UnhandledServerException)
             .WithWebApi("/eSCL",
                 m => m.WithController(() =>
-                    new EsclApiController(deviceCtx.Config, deviceCtx.ServerState, SecurityPolicy, Logger)));
-        await server.StartAsync(cancelToken);
+                    new EsclApiController(SecurityPolicy,serverState, Logger, ScanController,ScanningContext,scanServer)));
+				await server.StartAsync();
     }
 
     private Task UnhandledServerException(IHttpContext ctx, Exception ex)

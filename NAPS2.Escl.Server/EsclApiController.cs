@@ -5,6 +5,11 @@ using EmbedIO;
 using EmbedIO.Routing;
 using EmbedIO.WebApi;
 using Microsoft.Extensions.Logging;
+using NAPS2.Scan;
+using NAPS2.Remoting.Server;
+using System.Text;        // ← 添加这一行
+using System.Web;  // 需要引用 System.Web.dll
+using System.Text.Json;
 
 namespace NAPS2.Escl.Server;
 
@@ -13,18 +18,24 @@ internal class EsclApiController : WebApiController
     private static readonly XNamespace ScanNs = EsclXmlHelper.ScanNs;
     private static readonly XNamespace PwgNs = EsclXmlHelper.PwgNs;
 
-    private readonly EsclDeviceConfig _deviceConfig;
+    private EsclDeviceConfig _deviceConfig;
     private readonly EsclServerState _serverState;
     private readonly EsclSecurityPolicy _securityPolicy;
     private readonly ILogger _logger;
-
-    internal EsclApiController(EsclDeviceConfig deviceConfig, EsclServerState serverState,
-        EsclSecurityPolicy securityPolicy, ILogger logger)
+    private readonly ScanController _scanController;
+    private readonly ScanningContext _scanningContext;
+    private readonly ScanServer _scanServer;
+		private ScanDevice device;
+    internal EsclApiController(
+        EsclSecurityPolicy securityPolicy,EsclServerState serverState, ILogger logger, ScanController ScanController,ScanningContext ScanningContext,
+				ScanServer scanServer)
     {
-        _deviceConfig = deviceConfig;
-        _serverState = serverState;
+				_serverState = serverState;
         _securityPolicy = securityPolicy;
         _logger = logger;
+				_scanController = ScanController;
+				_scanningContext = ScanningContext;
+				_scanServer = scanServer;
     }
 
     protected override void OnBeforeHandler()
@@ -32,13 +43,88 @@ internal class EsclApiController : WebApiController
         base.OnBeforeHandler();
         if (_securityPolicy.HasFlag(EsclSecurityPolicy.ServerAllowAnyOrigin))
         {
-            Response.Headers.Add("Access-Control-Allow-Origin", "*");
+						Response.Headers.Add("Access-Control-Allow-Origin", "*");
+						// 允许的HTTP方法
+            Response.Headers.Add("Access-Control-Allow-Methods", "POST, GET, OPTIONS, HEAD, PUT, DELETE");
+						// 允许的请求头
+            Response.Headers.Add("Access-Control-Allow-Headers", "*");
         }
     }
 
-    [Route(HttpVerbs.Get, "/ScannerCapabilities")]
-    public async Task GetScannerCapabilities()
+		    // 添加OPTIONS方法处理
+    [Route(HttpVerbs.Options, "/ScannerCapabilities/{base64Id}")]
+    [Route(HttpVerbs.Options, "/ScannerStatus")]
+    [Route(HttpVerbs.Options, "/ScanJobs")]
+    [Route(HttpVerbs.Options, "/ScanJobs/{jobId}")]
+    [Route(HttpVerbs.Options, "/NextDocument")]
+    [Route(HttpVerbs.Options, "/Document")]
+    [Route(HttpVerbs.Options, "/Ping")]
+    [Route(HttpVerbs.Options, "/Devices")]
+    public Task HandleOptions()
     {
+        // 空响应，状态码200
+        return Task.CompletedTask;
+    }
+
+		// 辅助：根据 cfg.Name 计算 Base64 ID
+    private static string ComputeNameBase64(string name)
+    {
+        var bytes = Encoding.UTF8.GetBytes(name ?? "");
+        return Convert.ToBase64String(bytes);
+    }
+
+    // 找设备时，用同样算法去生成 Base64，再对比
+    private static ScanDevice? FindDeviceByBase64Id(IEnumerable<ScanDevice> devices, string base64Id)
+    {
+
+        if (string.IsNullOrWhiteSpace(base64Id))
+            return null;
+
+        // 如果你在生成时去掉了“=”填充，这里也要补齐
+        int mod4 = base64Id.Length % 4;
+        if (mod4 > 0) base64Id = base64Id.PadRight(base64Id.Length + (4 - mod4), '=');
+
+        return devices.FirstOrDefault(d =>
+            string.Equals(
+                ComputeNameBase64(d.Name).TrimEnd('='),
+                base64Id.TrimEnd('='), 
+                StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Route(HttpVerbs.Get, "/Devices")]
+    public async Task Devices(){
+				var devices = await _scanController.GetDeviceList(Driver.Wia);
+				var list = devices.Select(cfg => new
+				{
+						Name = cfg.Name,
+						Id   = ComputeNameBase64(cfg.Name).TrimEnd('=')
+				}).ToArray();
+
+				Response.ContentType = "application/json";
+				var bytes = JsonSerializer.SerializeToUtf8Bytes(list);
+				await Response.OutputStream.WriteAsync(bytes, 0, bytes.Length);
+		}
+
+    [Route(HttpVerbs.Get, "/ScannerCapabilities/{base64Id}")]
+    public async Task GetScannerCapabilities(string base64Id)
+    {
+
+				var devices = await _scanController.GetDeviceList(Driver.Wia);
+				if (devices == null || !devices.Any()){
+						Response.StatusCode = 404;
+						return;
+				}
+
+				var device = FindDeviceByBase64Id(devices,base64Id);
+				if (device == null)
+				{
+						_logger.LogWarning("未找到 ID 为 {ID} 的扫描仪", base64Id);
+						Response.StatusCode = 404;
+						return;
+				}
+
+				_deviceConfig = _scanServer.MakeEsclDeviceConfig2(device);
+
         var caps = _deviceConfig.Capabilities;
         var protocol = _securityPolicy.HasFlag(EsclSecurityPolicy.ServerRequireHttps) ? "https" : "http";
         var iconUri = caps.IconPng != null ? $"{protocol}://naps2-{caps.Uuid}.local.:{_deviceConfig.Port}/eSCL/icon.png" : "";
@@ -161,39 +247,76 @@ internal class EsclApiController : WebApiController
         await writer.WriteAsync(doc);
     }
 
-    [Route(HttpVerbs.Post, "/ScanJobs")]
-    public void CreateScanJob()
-    {
-        // TODO: Actually use job input for scan options
-        EsclScanSettings settings;
-        try
-        {
-            var doc = XDocument.Load(Request.InputStream);
-            settings = SettingsParser.Parse(doc);
-        }
-        catch (Exception)
-        {
-            Response.StatusCode = 400; // Bad request
-            return;
-        }
-        if (_serverState.IsProcessing)
-        {
-            Response.StatusCode = 503; // Service unavailable
-            return;
-        }
-        _serverState.IsProcessing = true;
-        var jobInfo = JobInfo.CreateNewJob(_serverState, _deviceConfig.CreateJob(settings));
-        _serverState.AddJob(jobInfo);
-        var uri = Request.Url;
-        if (Request.IsSecureConnection)
-        {
-            // Fix https://github.com/unosquare/embedio/issues/593
-            uri = new UriBuilder(uri) { Scheme = "https" }.Uri;
-        }
-        Response.Headers.Add("Access-Control-Expose-Headers", "Location");
-        Response.Headers.Add("Location", $"{uri}/{jobInfo.Id}");
-        Response.StatusCode = 201; // Created
-    }
+		[Route(HttpVerbs.Post, "/ScanJobs")]
+		public async Task CreateScanJob()
+		{
+				var base64Id = HttpContext.Request.QueryString["Id"];
+				var devices = await _scanController.GetDeviceList(Driver.Wia);
+				if (devices == null || !devices.Any()){
+						Response.StatusCode = 404;
+						return;
+				}
+
+				var device = FindDeviceByBase64Id(devices,base64Id);
+				if (device == null)
+				{
+						_logger.LogWarning("未找到 ID 为 {ID} 的扫描仪", base64Id);
+						Response.StatusCode = 404;
+						return;
+				}
+
+				// 1. 解析设置
+				EsclScanSettings settings;
+				try
+				{
+						var doc = XDocument.Load(Request.InputStream);
+						settings = SettingsParser.Parse(doc);
+				}
+				catch (Exception)
+				{
+						Response.StatusCode = 400;
+						return;
+				}
+
+				// 2. 如果已经在处理，返回 503
+				if (_serverState.IsProcessing)
+				{
+						Response.StatusCode = 503;
+						return;
+				}
+
+				try
+				{
+						//job = new ScanJob(_scanningContext, new ScanController(_scanningContext), device, settings);
+						// 4. 成功，注册作业并返回 201 + Location 头
+
+						_serverState.IsProcessing = true;
+						var jobInfo = JobInfo.CreateNewJob(_serverState,new ScanJob(_scanningContext, new ScanController(_scanningContext), device, settings));
+						_serverState.AddJob(jobInfo);
+						// 构建 Location URI
+						var uri = Request.Url;
+						if (Request.IsSecureConnection)
+						{
+								// EmbedIO HTTPS 修正
+								uri = new UriBuilder(uri) { Scheme = "https" }.Uri;
+						}
+
+						Response.Headers.Add("Access-Control-Expose-Headers", "Location");
+						Response.Headers.Add("Location", $"{uri}/{jobInfo.Id}");
+						Response.StatusCode = 201;
+				}
+				catch (Exception ex)
+				{
+						_logger.LogError(ex, "创建 ScanJob 时出错");
+						// 先设置状态码，再写入响应体，且不要用 using() 去自动关闭底层流
+						Response.StatusCode = 501;
+						Response.ContentType = "text/plain; charset=utf-8";
+						using var writer = new StreamWriter(HttpContext.OpenResponseStream());
+						await writer.WriteAsync(ex.ToString());
+						return;
+				}
+		}
+
 
     [Route(HttpVerbs.Delete, "/ScanJobs/{jobId}")]
     public void CancelScanJob(string jobId)

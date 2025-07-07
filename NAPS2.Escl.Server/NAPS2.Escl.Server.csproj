@@ -10,6 +10,11 @@
         <Product>NAPS2.Escl.Server</Product>
         <Description>ESCL server for NAPS2.Sdk.</Description>
         <PackageTags>naps2 escl</PackageTags>
+				<!-- 允许使用 C# 预览版语言特性 -->
+				<LangVersion>preview</LangVersion>
+
+				<!-- 启用 .NET SDK 的预览 API -->
+				<EnablePreviewFeatures>true</EnablePreviewFeatures>
     </PropertyGroup>
 
     <Import Project="..\NAPS2.Setup\targets\SdkPackageTargets.targets" />
@@ -20,6 +25,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\NAPS2.Escl\NAPS2.Escl.csproj" />
+        <ProjectReference Include="..\NAPS2.Sdk\NAPS2.Sdk.csproj" />
     </ItemGroup>
 
 </Project>
